@@ -1,0 +1,798 @@
+import asyncio
+import logging
+import math
+import os
+import sqlite3
+from datetime import datetime, date
+from typing import Dict, List
+
+import pandas as pd
+import requests
+from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
+from telegram.ext import (
+    ApplicationBuilder, ContextTypes, CommandHandler, MessageHandler,
+    CallbackQueryHandler, ConversationHandler, filters, PicklePersistence
+)
+
+# ==============================================================================
+# КОНФИГУРАЦИЯ
+# ==============================================================================
+logging.basicConfig(format='%(asctime)s - %(levelname)s - %(message)s', level=logging.INFO)
+logger = logging.getLogger(__name__)
+
+TOKEN = os.environ.get("FUTURES_BOT_TOKEN", "8723962906:AAFu7RV1FCvBJQl1rkhLQAHUMnWudxAoFEw")
+DB_PATH = "futures_calc.db"
+PERSISTENCE_FILE = "bot_persistence.pkl"
+
+# Один запрос по ВСЕМУ рынку FORTS (надёжнее, чем точечные запросы по каждому
+# тикеру: не нужно угадывать технический SECID биржи — просто фильтруем
+# результат на своей стороне по человекочитаемому SHORTNAME).
+MOEX_FORTS_URL = "https://iss.moex.com/iss/engines/futures/markets/forts/securities.json"
+MOEX_SYNC_INTERVAL_SECONDS = 6 * 3600  # обновлять параметры инструментов раз в 6 часов
+
+FEATURED_INSTRUMENTS = [
+    ("SILV-9.26", "Серебро"),
+    ("BR-9.26", "Нефть Brent"),
+    ("NG-8.26", "Природный газ (Генри Хаб)"),
+    ("COCOA-8.26", "Какао"),
+    ("CNY-9.26", "Курс юань – рубль"),
+    ("MIX-9.26", "Индекс МосБиржи"),
+    ("GOLD-9.26", "Золото"),
+]
+
+# Состояния FSM
+(
+    SELECTING_INSTRUMENT, ENTERING_CONTRACTS, AFTER_SUM,
+    CHOOSING_DIRECTION, ENTERING_ENTRY_PRICE, ENTERING_TAKE_PROFIT,
+    ENTERING_STOP_LOSS, ENTERING_ACCOUNT_SIZE
+) = range(8)
+
+STATE_BY_STEP = {
+    'contracts': ENTERING_CONTRACTS,
+    'entry_price': ENTERING_ENTRY_PRICE,
+    'tp': ENTERING_TAKE_PROFIT,
+    'sl': ENTERING_STOP_LOSS,
+    'account_size': ENTERING_ACCOUNT_SIZE,
+}
+
+# ==============================================================================
+# БАЗА ДАННЫХ
+# ==============================================================================
+class Database:
+    def __init__(self, db_path: str):
+        self.db_path = db_path
+        self._init_db()
+
+    def _get_conn(self):
+        return sqlite3.connect(self.db_path, check_same_thread=False)
+
+    def _init_db(self):
+        conn = self._get_conn()
+        try:
+            cursor = conn.cursor()
+            cursor.execute("""
+                CREATE TABLE IF NOT EXISTS instruments (
+                    ticker TEXT PRIMARY KEY, name TEXT, category TEXT,
+                    step_price REAL, step_cost REAL, go_initial REAL, expiry_date TEXT,
+                    volume REAL DEFAULT 0
+                )
+            """)
+            cursor.execute("""
+                CREATE TABLE IF NOT EXISTS calc_history (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT, user_id INTEGER, timestamp TEXT,
+                    ticker TEXT, direction TEXT, contracts INTEGER, entry_price REAL,
+                    tp_price REAL, sl_price REAL, account_size REAL,
+                    profit_rub REAL, loss_rub REAL, risk_reward REAL, margin_used REAL
+                )
+            """)
+            conn.commit()
+        finally:
+            conn.close()
+
+    def seed_default_instruments(self):
+        """Аварийный набор — гарантирует, что все инструменты из FEATURED_INSTRUMENTS
+        присутствуют в таблице (с плейсхолдер-значениями), даже если в БД уже есть
+        другие строки от прошлых запусков. INSERT OR IGNORE не трогает уже
+        существующие (реальные, полученные с биржи) записи по этим тикерам."""
+        conn = self._get_conn()
+        try:
+            cursor = conn.cursor()
+            defaults = [
+                (t, name, "featured", 1, 1, 1000, "", 0)
+                for t, name in FEATURED_INSTRUMENTS
+            ]
+            cursor.executemany(
+                "INSERT OR IGNORE INTO instruments VALUES (?,?,?,?,?,?,?,?)", defaults)
+            conn.commit()
+        finally:
+            conn.close()
+
+    def _upsert_instruments_sync(self, rows: List[Dict]):
+        conn = self._get_conn()
+        try:
+            cursor = conn.cursor()
+            cursor.executemany("""
+                INSERT INTO instruments (ticker, name, category, step_price, step_cost, go_initial, expiry_date, volume)
+                VALUES (:ticker, :name, :category, :step_price, :step_cost, :go_initial, :expiry_date, :volume)
+                ON CONFLICT(ticker) DO UPDATE SET
+                    name=excluded.name, category=excluded.category,
+                    step_price=excluded.step_price, step_cost=excluded.step_cost,
+                    go_initial=excluded.go_initial, expiry_date=excluded.expiry_date,
+                    volume=excluded.volume
+            """, rows)
+            conn.commit()
+        finally:
+            conn.close()
+
+    async def upsert_instruments(self, rows: List[Dict]):
+        await asyncio.to_thread(self._upsert_instruments_sync, rows)
+
+    def _save_calculation_sync(self, user_id: int, data: Dict, results: Dict):
+        conn = self._get_conn()
+        try:
+            cursor = conn.cursor()
+            cursor.execute("""
+                INSERT INTO calc_history
+                (user_id, timestamp, ticker, direction, contracts, entry_price,
+                 tp_price, sl_price, account_size, profit_rub, loss_rub, risk_reward, margin_used)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """, (user_id, datetime.now().isoformat(), data['ticker'], data['direction'],
+                  data['contracts'], data['entry_price'], data['tp'], data['sl'],
+                  data['account_size'], results['profit'], results['loss'],
+                  results['rr_ratio'], results['margin']))
+            conn.commit()
+        finally:
+            conn.close()
+
+    async def save_calculation(self, user_id: int, data: Dict, results: Dict):
+        await asyncio.to_thread(self._save_calculation_sync, user_id, data, results)
+
+    def _get_instruments_df_sync(self) -> pd.DataFrame:
+        conn = self._get_conn()
+        try:
+            return pd.read_sql_query("SELECT * FROM instruments", conn)
+        finally:
+            conn.close()
+
+    async def get_instruments_df(self) -> pd.DataFrame:
+        return await asyncio.to_thread(self._get_instruments_df_sync)
+
+db = Database(DB_PATH)
+
+# ==============================================================================
+# ИНТЕГРАЦИЯ С МОСБИРЖЕЙ (ISS API)
+# ==============================================================================
+def _fetch_moex_forts_sync() -> dict:
+    """Синхронный HTTP-запрос ко всему рынку FORTS одним вызовом.
+    Выполняется через asyncio.to_thread, чтобы не блокировать event loop бота."""
+    params = {
+        "iss.meta": "off",
+        "iss.only": "securities,marketdata",
+        "securities.columns": "SECID,SHORTNAME,SECNAME,MINSTEP,STEPPRICE,INITIALMARGIN,LASTTRADEDATE,ASSETCODE",
+        "marketdata.columns": "SECID,LAST,VOLTODAY",
+    }
+    resp = requests.get(MOEX_FORTS_URL, params=params, timeout=20)
+    resp.raise_for_status()
+    return resp.json()
+
+def _parse_moex_response(payload: dict, allow_expired: bool = False) -> List[Dict]:
+    """Разбирает ответ ISS в список словарей {ticker(SECID), name(SHORTNAME), ...},
+    готовых для записи в таблицу instruments."""
+    sec_block = payload.get("securities", {}) or {}
+    sec_cols = sec_block.get("columns", []) or []
+    sec_rows = sec_block.get("data", []) or []
+
+    md_block = payload.get("marketdata", {}) or {}
+    md_cols = md_block.get("columns", []) or []
+    md_rows = md_block.get("data", []) or []
+
+    def col_index(cols, name):
+        return cols.index(name) if name in cols else None
+
+    required = ["SECID", "SHORTNAME", "MINSTEP", "STEPPRICE", "INITIALMARGIN", "LASTTRADEDATE", "ASSETCODE"]
+    idx = {name: col_index(sec_cols, name) for name in required}
+    if any(idx[name] is None for name in ["SECID", "MINSTEP", "STEPPRICE", "INITIALMARGIN"]):
+        raise ValueError("Неожиданный формат ответа ISS МосБиржи (нет нужных колонок)")
+
+    volume_by_secid = {}
+    md_secid_idx = col_index(md_cols, "SECID")
+    md_vol_idx = col_index(md_cols, "VOLTODAY")
+    if md_secid_idx is not None and md_vol_idx is not None:
+        for row in md_rows:
+            try:
+                secid = row[md_secid_idx]
+                vol = row[md_vol_idx] or 0
+                volume_by_secid[secid] = float(vol)
+            except (IndexError, TypeError, ValueError):
+                continue
+
+    today = date.today().isoformat()
+    results = []
+    for row in sec_rows:
+        try:
+            secid = row[idx["SECID"]]
+            shortname = row[idx["SHORTNAME"]] or secid
+            min_step = row[idx["MINSTEP"]]
+            step_cost = row[idx["STEPPRICE"]]
+            go_initial = row[idx["INITIALMARGIN"]]
+            expiry = row[idx["LASTTRADEDATE"]] or ""
+            asset_code = row[idx["ASSETCODE"]] if idx["ASSETCODE"] is not None else ""
+        except (IndexError, TypeError):
+            continue
+
+        if not min_step or not step_cost or not go_initial:
+            continue
+        try:
+            min_step = float(min_step)
+            step_cost = float(step_cost)
+            go_initial = float(go_initial)
+        except (TypeError, ValueError):
+            continue
+        if min_step <= 0 or step_cost <= 0 or go_initial <= 0:
+            continue
+        if not allow_expired and expiry and expiry < today:
+            continue
+
+        results.append({
+            "ticker": secid,
+            "name": shortname,
+            "category": asset_code or "other",
+            "step_price": min_step,
+            "step_cost": step_cost,
+            "go_initial": go_initial,
+            "expiry_date": expiry,
+            "volume": volume_by_secid.get(secid, 0.0),
+        })
+    return results
+
+async def sync_moex_instruments() -> int:
+    """Загружает весь рынок FORTS одним запросом, затем отбирает только тикеры
+    из FEATURED_INSTRUMENTS — сопоставление идёт по точному совпадению
+    человекочитаемого кода (SHORTNAME биржи) без учёта регистра.
+    Отображаемое название переопределяется на заданное пользователем."""
+    try:
+        payload = await asyncio.to_thread(_fetch_moex_forts_sync)
+    except Exception:
+        logger.exception("МосБиржа: не удалось получить данные (сеть/HTTP)")
+        return 0
+
+    try:
+        # allow_expired=True: список инструментов задан явно, не отбрасываем их
+        # только из-за близкой/прошедшей даты экспирации.
+        all_rows = _parse_moex_response(payload, allow_expired=True)
+    except Exception:
+        logger.exception("МосБиржа: не удалось разобрать ответ ISS")
+        return 0
+
+    by_shortname = {r["name"].upper(): r for r in all_rows if r.get("name")}
+
+    matched: List[Dict] = []
+    for human_ticker, display_name in FEATURED_INSTRUMENTS:
+        row = by_shortname.get(human_ticker.upper())
+        if row is None:
+            logger.warning(f"МосБиржа: тикер '{human_ticker}' не найден среди инструментов FORTS "
+                            f"(проверьте точное написание кода на moex.com)")
+            continue
+        row = dict(row)
+        row["ticker"] = human_ticker  # используем ваш код как первичный ключ в нашей БД
+        row["name"] = display_name    # и ваше название для отображения
+        matched.append(row)
+
+    if not matched:
+        logger.warning("МосБиржа: ни один из отслеживаемых тикеров не найден в выгрузке")
+        return 0
+
+    await db.upsert_instruments(matched)
+    return len(matched)
+
+async def moex_sync_job(context: ContextTypes.DEFAULT_TYPE):
+    """Периодическая фоновая синхронизация (job_queue)."""
+    count = await sync_moex_instruments()
+    logger.info(f"МосБиржа: периодическая синхронизация — {count} из {len(FEATURED_INSTRUMENTS)} инструментов")
+
+async def post_init(app):
+    """Синхронизация с МосБиржей сразу при старте бота, до начала polling.
+    После синхронизации (даже частично успешной) добиваем плейсхолдерами любые
+    тикеры, которые не удалось найти/загрузить — чтобы кнопка на них всегда
+    была видна, а не пропадала молча."""
+    count = await sync_moex_instruments()
+    await asyncio.to_thread(db.seed_default_instruments)
+    if count < len(FEATURED_INSTRUMENTS):
+        logger.warning(
+            f"МосБиржа: загружено {count} из {len(FEATURED_INSTRUMENTS)} инструментов при старте; "
+            f"остальные показаны с плейсхолдер-значениями до следующей успешной синхронизации."
+        )
+    else:
+        logger.info(f"МосБиржа: успешно загружены все {count} инструментов при старте.")
+
+async def manual_sync(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Команда /sync — ручное обновление списка инструментов с МосБиржи."""
+    msg = await update.message.reply_text("🔄 Обновляю данные инструментов с МосБиржи...")
+    count = await sync_moex_instruments()
+    await asyncio.to_thread(db.seed_default_instruments)
+    if count == 0:
+        await msg.edit_text(
+            "⚠️ Не удалось обновить данные с МосБиржи (проблема с сетью, форматом ответа "
+            "или ни один тикер не найден). Использую ранее загруженные/запасные значения."
+        )
+    elif count < len(FEATURED_INSTRUMENTS):
+        await msg.edit_text(
+            f"⚠️ Обновлено {count} из {len(FEATURED_INSTRUMENTS)} инструментов. "
+            f"Остальные не найдены на бирже под указанными кодами (см. логи бота)."
+        )
+    else:
+        await msg.edit_text(f"✅ Обновлены все {count} инструментов с МосБиржи.")
+
+# ==============================================================================
+# КАЛЬКУЛЯТОР
+# ==============================================================================
+def calculate_quick_sum(contracts: int, instrument: Dict) -> Dict[str, float]:
+    go_initial = float(instrument['go_initial'])
+    margin = go_initial * contracts
+    return {"margin": round(margin, 2)}
+
+def calculate_futures(params: Dict, instrument: Dict) -> Dict[str, float]:
+    direction = params['direction']
+    entry = float(params['entry_price'])
+    tp = float(params['tp'])
+    sl = float(params['sl'])
+    contracts = int(params['contracts'])
+    account = float(params['account_size'])
+
+    step_price = float(instrument['step_price'])
+    step_cost = float(instrument['step_cost'])
+    go_initial = float(instrument['go_initial'])
+
+    if direction == 'long':
+        tp_diff = max(0, tp - entry)
+        sl_diff = max(0, entry - sl)
+    else:
+        tp_diff = max(0, entry - tp)
+        sl_diff = max(0, sl - entry)
+
+    steps_tp = tp_diff / step_price
+    steps_sl = sl_diff / step_price
+
+    profit = steps_tp * step_cost * contracts
+    loss = steps_sl * step_cost * contracts
+    rr = round(profit / loss, 2) if loss > 0 else float('inf')
+    margin = go_initial * contracts
+
+    return {
+        "profit": round(profit, 2), "loss": round(loss, 2),
+        "rr_ratio": rr, "margin": round(margin, 2),
+        "risk_pct": round((loss / account) * 100, 2) if account > 0 else 0,
+        "margin_pct": round((margin / account) * 100, 2) if account > 0 else 0,
+        "steps_tp": round(steps_tp, 1), "steps_sl": round(steps_sl, 1)
+    }
+
+# ==============================================================================
+# UI
+# ==============================================================================
+def instruments_list_keyboard(df: pd.DataFrame):
+    """Показывает фиксированный набор инструментов (FEATURED_INSTRUMENTS) строго
+    в заданном порядке."""
+    by_ticker = {row['ticker']: row for _, row in df.iterrows()}
+    kb = []
+    for ticker, display_name in FEATURED_INSTRUMENTS:
+        if ticker in by_ticker:
+            kb.append([InlineKeyboardButton(f"{ticker} — {display_name}", callback_data=f"inst_{ticker}")])
+    kb.append([InlineKeyboardButton("🔍 Поиск по тикеру", callback_data="search_mode")])
+    return InlineKeyboardMarkup(kb)
+
+def direction_keyboard():
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton("🟢 LONG", callback_data="dir_long"),
+         InlineKeyboardButton("🔴 SHORT", callback_data="dir_short")],
+        [InlineKeyboardButton("❌ Отмена", callback_data="cancel_calc")]
+    ])
+
+def cancel_keyboard():
+    return InlineKeyboardMarkup([[InlineKeyboardButton("❌ Отмена", callback_data="cancel_calc")]])
+
+def after_sum_keyboard():
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton("➡️ Продолжить к TP/SL/риску", callback_data="continue_full")],
+        [InlineKeyboardButton("🏁 Завершить", callback_data="finish_quick")],
+        [InlineKeyboardButton("❌ Отмена", callback_data="cancel_calc")]
+    ])
+
+def restart_keyboard():
+    return InlineKeyboardMarkup([[InlineKeyboardButton("🔄 Новый расчёт", callback_data="restart_calc")]])
+
+# ==============================================================================
+# ХЕНДЛЕРЫ
+# ==============================================================================
+
+async def _render_instrument_list(message_target, context: ContextTypes.DEFAULT_TYPE, edit: bool):
+    context.user_data.clear()
+    df = await db.get_instruments_df()
+
+    if df.empty:
+        text = "⚠️ Список инструментов пуст. Попробуйте команду /sync или зайдите позже."
+        if edit:
+            await message_target.edit_message_text(text)
+        else:
+            await message_target.reply_text(text)
+        return ConversationHandler.END
+
+    context.user_data['calc_params'] = {}
+    text = "Выберите инструмент:"
+    markup = instruments_list_keyboard(df)
+    if edit:
+        await message_target.edit_message_text(text, reply_markup=markup)
+    else:
+        await message_target.reply_text(text, reply_markup=markup)
+    return SELECTING_INSTRUMENT
+
+async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    return await _render_instrument_list(update.message, context, edit=False)
+
+async def restart_entry(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    return await _render_instrument_list(query, context, edit=True)
+
+async def stale_callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    try:
+        await query.answer("⏳ Сессия устарела. Нажмите /start для начала новой.")
+    except Exception:
+        pass
+    try:
+        await query.edit_message_text(
+            "⚠️ *Сессия устарела*\n\n"
+            "Возможно, бот был перезапущен или прошло слишком много времени.\n"
+            "Нажмите /start, чтобы начать заново.",
+            parse_mode="Markdown"
+        )
+    except Exception:
+        pass
+    return ConversationHandler.END
+
+async def search_mode(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    context.user_data['search_mode'] = True
+    await query.edit_message_text(
+        "🔍 Введите часть тикера (например, Si, BR, RI):",
+        reply_markup=cancel_keyboard()
+    )
+    return SELECTING_INSTRUMENT
+
+async def search_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not context.user_data.get('search_mode'):
+        df = await db.get_instruments_df()
+        await update.message.reply_text(
+            "Пожалуйста, выберите инструмент кнопками ниже, "
+            "либо нажмите «🔍 Поиск по тикеру».",
+            reply_markup=instruments_list_keyboard(df)
+        )
+        return SELECTING_INSTRUMENT
+
+    term = update.message.text.strip().upper()
+    df = await db.get_instruments_df()
+    matches = df[df['ticker'].str.contains(term, case=False, na=False) |
+                 df['name'].str.contains(term, case=False, na=False)]
+
+    context.user_data['search_mode'] = False
+
+    if matches.empty:
+        context.user_data['search_mode'] = True
+        await update.message.reply_text(f"❌ '{term}' не найден. Попробуйте снова:",
+                                        reply_markup=cancel_keyboard())
+        return SELECTING_INSTRUMENT
+
+    await update.message.reply_text(
+        f"Найдено {len(matches)}:",
+        reply_markup=instruments_list_keyboard(matches)
+    )
+    return SELECTING_INSTRUMENT
+
+async def instrument_selected(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+
+    ticker = query.data.replace("inst_", "")
+    df = await db.get_instruments_df()
+    matches = df[df['ticker'] == ticker]
+    if matches.empty:
+        await query.edit_message_text("⚠️ Инструмент не найден. Выберите заново:",
+                                      reply_markup=instruments_list_keyboard(df))
+        return SELECTING_INSTRUMENT
+    inst = matches.to_dict('records')[0]
+
+    context.user_data.setdefault('calc_params', {})
+    context.user_data['instrument'] = inst
+    context.user_data['calc_params']['ticker'] = ticker
+    context.user_data['next_step'] = 'contracts'
+
+    expiry_line = f"Экспирация: {inst['expiry_date']}" if inst.get('expiry_date') else "Экспирация: нет данных"
+    await query.edit_message_text(
+        f"📌 *{ticker}* ({inst['name']})\n"
+        f"Шаг: {inst['step_price']} | Стоимость шага: {inst['step_cost']}₽\n"
+        f"ГО: {inst['go_initial']}₽ | {expiry_line}\n\n"
+        f"➡️ Введите количество контрактов:",
+        parse_mode="Markdown", reply_markup=cancel_keyboard()
+    )
+    return ENTERING_CONTRACTS
+
+async def continue_full(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+
+    if 'instrument' not in context.user_data or 'contracts' not in context.user_data.get('calc_params', {}):
+        await query.edit_message_text("⚠️ Сессия устарела. /start")
+        return ConversationHandler.END
+
+    await query.edit_message_text("Выберите направление:", reply_markup=direction_keyboard())
+    return CHOOSING_DIRECTION
+
+async def finish_quick(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    context.user_data.clear()
+    await query.edit_message_text("✅ Готово.", reply_markup=restart_keyboard())
+    return ConversationHandler.END
+
+async def direction_chosen(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+
+    params = context.user_data.get('calc_params', {})
+    if 'instrument' not in context.user_data or 'contracts' not in params:
+        await query.edit_message_text("⚠️ Сессия устарела. /start")
+        return ConversationHandler.END
+
+    direction = query.data.replace("dir_", "")
+    params['direction'] = direction
+    context.user_data['next_step'] = 'entry_price'
+
+    emoji = "🟢 LONG" if direction == "long" else "🔴 SHORT"
+    await query.edit_message_text(
+        f"Направление: *{emoji}*\n\n➡️ Цена входа:",
+        parse_mode="Markdown", reply_markup=cancel_keyboard()
+    )
+    return ENTERING_ENTRY_PRICE
+
+async def numeric_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if 'instrument' not in context.user_data or 'calc_params' not in context.user_data:
+        await update.message.reply_text("⚠️ Сессия истекла. Начните с /start")
+        return ConversationHandler.END
+
+    next_step = context.user_data.get('next_step', 'contracts')
+    current_state = STATE_BY_STEP.get(next_step, ENTERING_CONTRACTS)
+
+    text = update.message.text.strip().replace(",", ".")
+    try:
+        value = float(text)
+        if not math.isfinite(value):
+            raise ValueError("non-finite value")
+        if value <= 0:
+            raise ValueError("non-positive value")
+    except (ValueError, OverflowError):
+        await update.message.reply_text("⚠️ Введите корректное положительное число:",
+                                        reply_markup=cancel_keyboard())
+        return current_state
+
+    params = context.user_data['calc_params']
+
+    if next_step == 'contracts':
+        if not value.is_integer():
+            await update.message.reply_text(
+                "⚠️ Количество контрактов должно быть целым числом (например, 1, 2, 5):",
+                reply_markup=cancel_keyboard())
+            return current_state
+        contracts = int(value)
+        params['contracts'] = contracts
+
+        instrument = context.user_data['instrument']
+        try:
+            quick = calculate_quick_sum(contracts, instrument)
+        except Exception:
+            logger.exception("Ошибка при расчёте суммы позиции")
+            await update.message.reply_text(
+                "⚠️ Не удалось посчитать сумму позиции. Попробуйте начать заново: /start")
+            context.user_data.clear()
+            return ConversationHandler.END
+
+        result_text = (
+            f"📌 *{params['ticker']}*\n"
+            f"Количество: {contracts} контр.\n"
+            f"━━━━━━━━━━━━━━━━━━━━\n"
+            f"🏦 *Сумма позиции (ГО):* {quick['margin']:,.0f} ₽\n"
+            f"━━━━━━━━━━━━━━━━━━━━"
+        )
+        await update.message.reply_text(result_text, parse_mode="Markdown", reply_markup=after_sum_keyboard())
+        return AFTER_SUM
+
+    elif next_step == 'entry_price':
+        params['entry_price'] = value
+        context.user_data['next_step'] = 'tp'
+        await update.message.reply_text("➡️ Цель (Take-Profit):", reply_markup=cancel_keyboard())
+        return ENTERING_TAKE_PROFIT
+
+    elif next_step == 'tp':
+        direction = params.get('direction')
+        entry = params.get('entry_price')
+        if direction == 'long' and value <= entry:
+            await update.message.reply_text(
+                f"⚠️ Для LONG цель (TP) должна быть выше цены входа ({entry}). Введите заново:",
+                reply_markup=cancel_keyboard())
+            return current_state
+        if direction == 'short' and value >= entry:
+            await update.message.reply_text(
+                f"⚠️ Для SHORT цель (TP) должна быть ниже цены входа ({entry}). Введите заново:",
+                reply_markup=cancel_keyboard())
+            return current_state
+        params['tp'] = value
+        context.user_data['next_step'] = 'sl'
+        await update.message.reply_text("➡️ Стоп-лосс (Stop-Loss):", reply_markup=cancel_keyboard())
+        return ENTERING_STOP_LOSS
+
+    elif next_step == 'sl':
+        direction = params.get('direction')
+        entry = params.get('entry_price')
+        if direction == 'long' and value >= entry:
+            await update.message.reply_text(
+                f"⚠️ Для LONG стоп-лосс должен быть ниже цены входа ({entry}). Введите заново:",
+                reply_markup=cancel_keyboard())
+            return current_state
+        if direction == 'short' and value <= entry:
+            await update.message.reply_text(
+                f"⚠️ Для SHORT стоп-лосс должен быть выше цены входа ({entry}). Введите заново:",
+                reply_markup=cancel_keyboard())
+            return current_state
+        params['sl'] = value
+        context.user_data['next_step'] = 'account_size'
+        await update.message.reply_text("➡️ Размер счета (депозит) в ₽:", reply_markup=cancel_keyboard())
+        return ENTERING_ACCOUNT_SIZE
+
+    elif next_step == 'account_size':
+        params['account_size'] = value
+        try:
+            results = calculate_futures(params, context.user_data['instrument'])
+            await db.save_calculation(update.effective_user.id, params, results)
+        except Exception:
+            logger.exception("Ошибка при расчёте/сохранении")
+            await update.message.reply_text(
+                "⚠️ Произошла ошибка при расчёте. Попробуйте начать заново: /start")
+            context.user_data.clear()
+            return ConversationHandler.END
+
+        dir_label = "LONG 🟢" if params['direction'] == 'long' else "SHORT 🔴"
+        result_text = (
+            f"✅ *РАСЧЕТ ГОТОВ*\n━━━━━━━━━━━━━━━━━━━━\n"
+            f"📌 {params['ticker']} | {dir_label} | {int(params['contracts'])} контр.\n"
+            f"Вход: {params['entry_price']} → TP: {params['tp']} / SL: {params['sl']}\n\n"
+            f"💰 *Прибыль:* {results['profit']:,.0f} ₽ ({results['steps_tp']} шагов)\n"
+            f"📉 *Убыток:* {results['loss']:,.0f} ₽ ({results['steps_sl']} шагов)\n"
+            f"⚖️ *Risk/Reward:* 1 : {results['rr_ratio']}\n\n"
+            f"🏦 *Маржа (ГО):* {results['margin']:,.0f} ₽ ({results['margin_pct']}%)\n"
+            f"⚠️ *Риск:* {results['risk_pct']}% от счета\n━━━━━━━━━━━━━━━━━━━━"
+        )
+
+        context.user_data.clear()
+
+        await update.message.reply_text(result_text, parse_mode="Markdown",
+                                        reply_markup=restart_keyboard())
+        return ConversationHandler.END
+
+    context.user_data.clear()
+    await update.message.reply_text("⚠️ Что-то пошло не так. Начните заново: /start")
+    return ConversationHandler.END
+
+async def cancel_calc(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    context.user_data.clear()
+    await query.edit_message_text("❌ Расчет отменен.", reply_markup=restart_keyboard())
+    return ConversationHandler.END
+
+async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE):
+    logger.error(f"Exception: {context.error}", exc_info=context.error)
+    try:
+        if isinstance(update, Update) and update.effective_message:
+            await update.effective_message.reply_text(
+                "⚠️ Произошла непредвиденная ошибка. Попробуйте /start."
+            )
+    except Exception:
+        pass
+
+# ==============================================================================
+# ЗАПУСК
+# ==============================================================================
+def main():
+    if not TOKEN:
+        raise RuntimeError(
+            "Не задан токен бота. Установите переменную окружения FUTURES_BOT_TOKEN."
+        )
+
+    # Для conversation_timeout и job_queue (периодическая синхронизация с МосБиржей)
+    # вместе с persistent=True нужен:
+    #   pip install "python-telegram-bot[job-queue]"
+    persistence = PicklePersistence(filepath=PERSISTENCE_FILE)
+    app = (
+        ApplicationBuilder()
+        .token(TOKEN)
+        .persistence(persistence)
+        .post_init(post_init)  # синхронизация с МосБиржей перед стартом polling
+        .build()
+    )
+
+    if app.job_queue is not None:
+        app.job_queue.run_repeating(
+            moex_sync_job, interval=MOEX_SYNC_INTERVAL_SECONDS, first=MOEX_SYNC_INTERVAL_SECONDS
+        )
+    else:
+        logger.warning(
+            "job_queue недоступен — периодическая синхронизация с МосБиржей отключена. "
+            "Установите пакет: pip install \"python-telegram-bot[job-queue]\""
+        )
+
+    conv_handler = ConversationHandler(
+        entry_points=[
+            CommandHandler("start", start),
+            CallbackQueryHandler(restart_entry, pattern="^restart_calc$"),
+        ],
+        states={
+            SELECTING_INSTRUMENT: [
+                CallbackQueryHandler(search_mode, pattern="^search_mode$"),
+                CallbackQueryHandler(instrument_selected, pattern="^inst_"),
+                CallbackQueryHandler(cancel_calc, pattern="^cancel_calc$"),
+                MessageHandler(filters.TEXT & ~filters.COMMAND, search_handler),
+            ],
+            ENTERING_CONTRACTS: [
+                CallbackQueryHandler(cancel_calc, pattern="^cancel_calc$"),
+                MessageHandler(filters.TEXT & ~filters.COMMAND, numeric_handler),
+            ],
+            AFTER_SUM: [
+                CallbackQueryHandler(continue_full, pattern="^continue_full$"),
+                CallbackQueryHandler(finish_quick, pattern="^finish_quick$"),
+                CallbackQueryHandler(cancel_calc, pattern="^cancel_calc$"),
+            ],
+            CHOOSING_DIRECTION: [
+                CallbackQueryHandler(direction_chosen, pattern="^dir_"),
+                CallbackQueryHandler(cancel_calc, pattern="^cancel_calc$"),
+            ],
+            ENTERING_ENTRY_PRICE: [
+                CallbackQueryHandler(cancel_calc, pattern="^cancel_calc$"),
+                MessageHandler(filters.TEXT & ~filters.COMMAND, numeric_handler),
+            ],
+            ENTERING_TAKE_PROFIT: [
+                CallbackQueryHandler(cancel_calc, pattern="^cancel_calc$"),
+                MessageHandler(filters.TEXT & ~filters.COMMAND, numeric_handler),
+            ],
+            ENTERING_STOP_LOSS: [
+                CallbackQueryHandler(cancel_calc, pattern="^cancel_calc$"),
+                MessageHandler(filters.TEXT & ~filters.COMMAND, numeric_handler),
+            ],
+            ENTERING_ACCOUNT_SIZE: [
+                CallbackQueryHandler(cancel_calc, pattern="^cancel_calc$"),
+                MessageHandler(filters.TEXT & ~filters.COMMAND, numeric_handler),
+            ],
+        },
+        fallbacks=[
+            CommandHandler("cancel", cancel_calc),
+            CommandHandler("start", start),
+            CallbackQueryHandler(restart_entry, pattern="^restart_calc$"),
+            CallbackQueryHandler(cancel_calc, pattern="^cancel_calc$"),
+            CallbackQueryHandler(stale_callback_handler),
+        ],
+        per_message=False,
+        conversation_timeout=1800,
+        name="futures_calc_conv",
+        persistent=True,
+    )
+
+    app.add_handler(CommandHandler("sync", manual_sync))
+    app.add_handler(conv_handler)
+    app.add_handler(CallbackQueryHandler(stale_callback_handler))
+
+    app.add_error_handler(error_handler)
+
+    logger.info("🚀 Бот запущен: данные по фьючерсам синхронизируются с МосБиржей (ISS API)!")
+    app.run_polling(drop_pending_updates=True)
+
+if __name__ == "__main__":
+    main()
