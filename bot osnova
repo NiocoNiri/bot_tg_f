@@ -85,6 +85,12 @@ class Database:
                     profit_rub REAL, loss_rub REAL, risk_reward REAL, margin_used REAL
                 )
             """)
+            # Миграция: добавляем open_interest, если таблица instruments была
+            # создана более ранней версией бота и колонки ещё нет.
+            cursor.execute("PRAGMA table_info(instruments)")
+            existing_cols = {row[1] for row in cursor.fetchall()}
+            if "open_interest" not in existing_cols:
+                cursor.execute("ALTER TABLE instruments ADD COLUMN open_interest REAL DEFAULT 0")
             conn.commit()
         finally:
             conn.close()
@@ -98,11 +104,11 @@ class Database:
         try:
             cursor = conn.cursor()
             defaults = [
-                (t, name, "featured", 1, 1, 1000, "", 0)
+                (t, name, "featured", 1, 1, 1000, "", 0, 0)
                 for t, name in FEATURED_INSTRUMENTS
             ]
             cursor.executemany(
-                "INSERT OR IGNORE INTO instruments VALUES (?,?,?,?,?,?,?,?)", defaults)
+                "INSERT OR IGNORE INTO instruments VALUES (?,?,?,?,?,?,?,?,?)", defaults)
             conn.commit()
         finally:
             conn.close()
@@ -112,13 +118,13 @@ class Database:
         try:
             cursor = conn.cursor()
             cursor.executemany("""
-                INSERT INTO instruments (ticker, name, category, step_price, step_cost, go_initial, expiry_date, volume)
-                VALUES (:ticker, :name, :category, :step_price, :step_cost, :go_initial, :expiry_date, :volume)
+                INSERT INTO instruments (ticker, name, category, step_price, step_cost, go_initial, expiry_date, volume, open_interest)
+                VALUES (:ticker, :name, :category, :step_price, :step_cost, :go_initial, :expiry_date, :volume, :open_interest)
                 ON CONFLICT(ticker) DO UPDATE SET
                     name=excluded.name, category=excluded.category,
                     step_price=excluded.step_price, step_cost=excluded.step_cost,
                     go_initial=excluded.go_initial, expiry_date=excluded.expiry_date,
-                    volume=excluded.volume
+                    volume=excluded.volume, open_interest=excluded.open_interest
             """, rows)
             conn.commit()
         finally:
@@ -169,7 +175,7 @@ def _fetch_moex_forts_sync() -> dict:
         "iss.meta": "off",
         "iss.only": "securities,marketdata",
         "securities.columns": "SECID,SHORTNAME,SECNAME,MINSTEP,STEPPRICE,INITIALMARGIN,LASTTRADEDATE,ASSETCODE",
-        "marketdata.columns": "SECID,LAST,VOLTODAY",
+        "marketdata.columns": "SECID,LAST,VOLTODAY,OPENPOSITION",
     }
     resp = requests.get(MOEX_FORTS_URL, params=params, timeout=20)
     resp.raise_for_status()
@@ -195,16 +201,26 @@ def _parse_moex_response(payload: dict, allow_expired: bool = False) -> List[Dic
         raise ValueError("Неожиданный формат ответа ISS МосБиржи (нет нужных колонок)")
 
     volume_by_secid = {}
+    oi_by_secid = {}
     md_secid_idx = col_index(md_cols, "SECID")
     md_vol_idx = col_index(md_cols, "VOLTODAY")
-    if md_secid_idx is not None and md_vol_idx is not None:
+    md_oi_idx = col_index(md_cols, "OPENPOSITION")
+    if md_secid_idx is not None:
         for row in md_rows:
             try:
                 secid = row[md_secid_idx]
-                vol = row[md_vol_idx] or 0
-                volume_by_secid[secid] = float(vol)
-            except (IndexError, TypeError, ValueError):
+            except IndexError:
                 continue
+            if md_vol_idx is not None:
+                try:
+                    volume_by_secid[secid] = float(row[md_vol_idx] or 0)
+                except (IndexError, TypeError, ValueError):
+                    pass
+            if md_oi_idx is not None:
+                try:
+                    oi_by_secid[secid] = float(row[md_oi_idx] or 0)
+                except (IndexError, TypeError, ValueError):
+                    pass
 
     today = date.today().isoformat()
     results = []
@@ -242,6 +258,7 @@ def _parse_moex_response(payload: dict, allow_expired: bool = False) -> List[Dic
             "go_initial": go_initial,
             "expiry_date": expiry,
             "volume": volume_by_secid.get(secid, 0.0),
+            "open_interest": oi_by_secid.get(secid, 0.0),
         })
     return results
 
@@ -330,6 +347,25 @@ def calculate_quick_sum(contracts: int, instrument: Dict) -> Dict[str, float]:
     go_initial = float(instrument['go_initial'])
     margin = go_initial * contracts
     return {"margin": round(margin, 2)}
+
+def calculate_open_interest_value(instrument: Dict):
+    """Открытый интерес (OI) — общее число открытых контрактов по инструменту
+    на всём рынке (поле OPENPOSITION с МосБиржи), не зависит от количества
+    контрактов пользователя. 'Сумма' в рублях = OI x ГО — сколько денег в виде
+    гарантийного обеспечения зарезервировано под все открытые позиции на рынке.
+    Возвращает None, если данных по OI нет (например, инструмент на плейсхолдерах)."""
+    oi = instrument.get('open_interest')
+    go_initial = instrument.get('go_initial')
+    if not oi or not go_initial:
+        return None
+    try:
+        oi = float(oi)
+        go_initial = float(go_initial)
+    except (TypeError, ValueError):
+        return None
+    if oi <= 0 or go_initial <= 0:
+        return None
+    return {"open_interest": oi, "oi_value_rub": round(oi * go_initial, 2)}
 
 def calculate_futures(params: Dict, instrument: Dict) -> Dict[str, float]:
     direction = params['direction']
@@ -589,6 +625,7 @@ async def numeric_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         instrument = context.user_data['instrument']
         try:
             quick = calculate_quick_sum(contracts, instrument)
+            oi = calculate_open_interest_value(instrument)
         except Exception:
             logger.exception("Ошибка при расчёте суммы позиции")
             await update.message.reply_text(
@@ -596,11 +633,18 @@ async def numeric_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             context.user_data.clear()
             return ConversationHandler.END
 
+        oi_line = (
+            f"📊 *Сумма позиций (откр. интерес):* {oi['oi_value_rub']:,.0f} ₽ "
+            f"(OI: {oi['open_interest']:,.0f} контр.)\n"
+            if oi else
+            "📊 *Сумма позиций (откр. интерес):* нет данных\n"
+        )
         result_text = (
             f"📌 *{params['ticker']}*\n"
             f"Количество: {contracts} контр.\n"
             f"━━━━━━━━━━━━━━━━━━━━\n"
             f"🏦 *Сумма позиции (ГО):* {quick['margin']:,.0f} ₽\n"
+            f"{oi_line}"
             f"━━━━━━━━━━━━━━━━━━━━"
         )
         await update.message.reply_text(result_text, parse_mode="Markdown", reply_markup=after_sum_keyboard())
