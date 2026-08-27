@@ -91,6 +91,8 @@ class Database:
             existing_cols = {row[1] for row in cursor.fetchall()}
             if "open_interest" not in existing_cols:
                 cursor.execute("ALTER TABLE instruments ADD COLUMN open_interest REAL DEFAULT 0")
+            if "last_price" not in existing_cols:
+                cursor.execute("ALTER TABLE instruments ADD COLUMN last_price REAL DEFAULT 0")
             conn.commit()
         finally:
             conn.close()
@@ -104,11 +106,11 @@ class Database:
         try:
             cursor = conn.cursor()
             defaults = [
-                (t, name, "featured", 1, 1, 1000, "", 0, 0)
+                (t, name, "featured", 1, 1, 1000, "", 0, 0, 0)
                 for t, name in FEATURED_INSTRUMENTS
             ]
             cursor.executemany(
-                "INSERT OR IGNORE INTO instruments VALUES (?,?,?,?,?,?,?,?,?)", defaults)
+                "INSERT OR IGNORE INTO instruments VALUES (?,?,?,?,?,?,?,?,?,?)", defaults)
             conn.commit()
         finally:
             conn.close()
@@ -118,13 +120,14 @@ class Database:
         try:
             cursor = conn.cursor()
             cursor.executemany("""
-                INSERT INTO instruments (ticker, name, category, step_price, step_cost, go_initial, expiry_date, volume, open_interest)
-                VALUES (:ticker, :name, :category, :step_price, :step_cost, :go_initial, :expiry_date, :volume, :open_interest)
+                INSERT INTO instruments (ticker, name, category, step_price, step_cost, go_initial, expiry_date, volume, open_interest, last_price)
+                VALUES (:ticker, :name, :category, :step_price, :step_cost, :go_initial, :expiry_date, :volume, :open_interest, :last_price)
                 ON CONFLICT(ticker) DO UPDATE SET
                     name=excluded.name, category=excluded.category,
                     step_price=excluded.step_price, step_cost=excluded.step_cost,
                     go_initial=excluded.go_initial, expiry_date=excluded.expiry_date,
-                    volume=excluded.volume, open_interest=excluded.open_interest
+                    volume=excluded.volume, open_interest=excluded.open_interest,
+                    last_price=excluded.last_price
             """, rows)
             conn.commit()
         finally:
@@ -202,9 +205,11 @@ def _parse_moex_response(payload: dict, allow_expired: bool = False) -> List[Dic
 
     volume_by_secid = {}
     oi_by_secid = {}
+    last_by_secid = {}
     md_secid_idx = col_index(md_cols, "SECID")
     md_vol_idx = col_index(md_cols, "VOLTODAY")
     md_oi_idx = col_index(md_cols, "OPENPOSITION")
+    md_last_idx = col_index(md_cols, "LAST")
     if md_secid_idx is not None:
         for row in md_rows:
             try:
@@ -219,6 +224,11 @@ def _parse_moex_response(payload: dict, allow_expired: bool = False) -> List[Dic
             if md_oi_idx is not None:
                 try:
                     oi_by_secid[secid] = float(row[md_oi_idx] or 0)
+                except (IndexError, TypeError, ValueError):
+                    pass
+            if md_last_idx is not None:
+                try:
+                    last_by_secid[secid] = float(row[md_last_idx] or 0)
                 except (IndexError, TypeError, ValueError):
                     pass
 
@@ -259,6 +269,7 @@ def _parse_moex_response(payload: dict, allow_expired: bool = False) -> List[Dic
             "expiry_date": expiry,
             "volume": volume_by_secid.get(secid, 0.0),
             "open_interest": oi_by_secid.get(secid, 0.0),
+            "last_price": last_by_secid.get(secid, 0.0),
         })
     return results
 
@@ -366,6 +377,29 @@ def calculate_open_interest_value(instrument: Dict):
     if oi <= 0 or go_initial <= 0:
         return None
     return {"open_interest": oi, "oi_value_rub": round(oi * go_initial, 2)}
+
+def calculate_position_size(contracts: int, instrument: Dict):
+    """Размер позиции пользователя в рублях по ТЕКУЩЕЙ рыночной цене (LAST с биржи),
+    без ручного ввода цены входа: размер = LAST_цена x мультипликатор x количество,
+    где мультипликатор (рублей за 1 пункт цены) = STEPPRICE / MINSTEP.
+    Возвращает None, если текущая цена ещё не подтянулась с биржи (например,
+    инструмент на плейсхолдерах или торги не шли сегодня)."""
+    last_price = instrument.get('last_price')
+    step_price = instrument.get('step_price')
+    step_cost = instrument.get('step_cost')
+    if not last_price or not step_price or not step_cost:
+        return None
+    try:
+        last_price = float(last_price)
+        step_price = float(step_price)
+        step_cost = float(step_cost)
+    except (TypeError, ValueError):
+        return None
+    if last_price <= 0 or step_price <= 0 or step_cost <= 0:
+        return None
+    multiplier = step_cost / step_price
+    notional = last_price * multiplier * contracts
+    return {"last_price": last_price, "notional_rub": round(notional, 2)}
 
 def calculate_futures(params: Dict, instrument: Dict) -> Dict[str, float]:
     direction = params['direction']
@@ -626,6 +660,7 @@ async def numeric_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         try:
             quick = calculate_quick_sum(contracts, instrument)
             oi = calculate_open_interest_value(instrument)
+            size = calculate_position_size(contracts, instrument)
         except Exception:
             logger.exception("Ошибка при расчёте суммы позиции")
             await update.message.reply_text(
@@ -639,12 +674,18 @@ async def numeric_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             if oi else
             "📊 *Сумма позиций (откр. интерес):* нет данных\n"
         )
+        size_line = (
+            f"📐 *Размер позиции (по тек. цене {size['last_price']:g}):* {size['notional_rub']:,.0f} ₽\n"
+            if size else
+            "📐 *Размер позиции (по тек. цене):* нет данных (торгов сегодня не было)\n"
+        )
         result_text = (
             f"📌 *{params['ticker']}*\n"
             f"Количество: {contracts} контр.\n"
             f"━━━━━━━━━━━━━━━━━━━━\n"
             f"🏦 *Сумма позиции (ГО):* {quick['margin']:,.0f} ₽\n"
             f"{oi_line}"
+            f"{size_line}"
             f"━━━━━━━━━━━━━━━━━━━━"
         )
         await update.message.reply_text(result_text, parse_mode="Markdown", reply_markup=after_sum_keyboard())
