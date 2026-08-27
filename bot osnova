@@ -730,7 +730,11 @@ async def numeric_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             return current_state
         params['sl'] = value
         context.user_data['next_step'] = 'account_size'
-        await update.message.reply_text("➡️ Размер счета (депозит) в ₽:", reply_markup=cancel_keyboard())
+        await update.message.reply_text(
+            "➡️ Введите размер ВСЕГО вашего торгового счёта (общий капитал в ₽).\n"
+            "Это не сумма по этой позиции (ГО/размер позиции мы уже посчитали выше) — "
+            "нужно, чтобы показать, какой % от всего капитала вы рискуете потерять/заработать:",
+            reply_markup=cancel_keyboard())
         return ENTERING_ACCOUNT_SIZE
 
     elif next_step == 'account_size':
@@ -754,7 +758,7 @@ async def numeric_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             f"📉 *Убыток:* {results['loss']:,.0f} ₽ ({results['steps_sl']} шагов)\n"
             f"⚖️ *Risk/Reward:* 1 : {results['rr_ratio']}\n\n"
             f"🏦 *Маржа (ГО):* {results['margin']:,.0f} ₽ ({results['margin_pct']}%)\n"
-            f"⚠️ *Риск:* {results['risk_pct']}% от счета\n━━━━━━━━━━━━━━━━━━━━"
+            f"⚠️ *Риск:* {results['risk_pct']}% от общего капитала счёта\n━━━━━━━━━━━━━━━━━━━━"
         )
 
         context.user_data.clear()
