@@ -32,9 +32,9 @@ MOEX_SYNC_INTERVAL_SECONDS = 6 * 3600  # обновлять параметры �
 
 FEATURED_INSTRUMENTS = [
     ("SILV-9.26", "Серебро"),
-    ("BR-9.26", "Нефть Brent"),
-    ("NG-8.26", "Природный газ (Генри Хаб)"),
-    ("COCOA-8.26", "Какао"),
+    ("BR-10.26", "Нефть Brent"),           # BR-9.26 близко к экспирации (Brent - месячный контракт) — взят следующий месяц с запасом
+    ("NG-9.26", "Природный газ (Генри Хаб)"),  # NG-8.26 уже экспирировал (август прошёл)
+    ("COCOA-11.26", "Какао"),              # COCOA-8.26 уже экспирировал; следующая серия по новому графику биржи — ноябрь
     ("CNY-9.26", "Курс юань – рубль"),
     ("MIX-9.26", "Индекс МосБиржи"),
     ("GOLD-9.26", "Золото"),
@@ -56,6 +56,11 @@ STATE_BY_STEP = {
     'tp': ENTERING_TAKE_PROFIT,
     'sl': ENTERING_STOP_LOSS,
 }
+
+def fmt_rub(value) -> str:
+    """Форматирует число в привычном для русского читателя виде: пробел как
+    разделитель разрядов (36 000, не 36,000), без десятичных знаков."""
+    return f"{value:,.0f}".replace(",", " ")
 
 # ==============================================================================
 # БАЗА ДАННЫХ
@@ -580,10 +585,24 @@ async def instrument_selected(update: Update, context: ContextTypes.DEFAULT_TYPE
     context.user_data['next_step'] = 'contracts'
 
     expiry_line = f"Экспирация: {inst['expiry_date']}" if inst.get('expiry_date') else "Экспирация: нет данных"
+    warning_line = ""
+    expiry = inst.get('expiry_date')
+    if expiry:
+        try:
+            if expiry < date.today().isoformat():
+                warning_line = (
+                    "\n⚠️ *Внимание:* по данным биржи, срок обращения этого контракта уже истёк "
+                    "(экспирация была раньше сегодняшней даты). Возможно, нужна более новая серия "
+                    "контракта — проверьте на moex.com или выполните /sync.\n"
+                )
+        except TypeError:
+            pass
+
     await query.edit_message_text(
         f"📌 *{ticker}* ({inst['name']})\n"
         f"Шаг: {inst['step_price']} | Стоимость шага: {inst['step_cost']}₽\n"
-        f"ГО: {inst['go_initial']}₽ | {expiry_line}\n\n"
+        f"ГО: {inst['go_initial']}₽ | {expiry_line}\n"
+        f"{warning_line}\n"
         f"➡️ Введите количество контрактов:",
         parse_mode="Markdown", reply_markup=cancel_keyboard()
     )
@@ -672,13 +691,13 @@ async def numeric_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             return ConversationHandler.END
 
         oi_line = (
-            f"📊 *Сумма позиций (откр. интерес):* {oi['oi_value_rub']:,.0f} ₽ "
-            f"(OI: {oi['open_interest']:,.0f} контр.)\n"
+            f"📊 *Сумма позиций (откр. интерес):* {fmt_rub(oi['oi_value_rub'])} ₽ "
+            f"(OI: {fmt_rub(oi['open_interest'])} контр.)\n"
             if oi else
             "📊 *Сумма позиций (откр. интерес):* нет данных\n"
         )
         size_line = (
-            f"📐 *Размер позиции (по тек. цене {size['last_price']:g}):* {size['notional_rub']:,.0f} ₽\n"
+            f"📐 *Размер позиции (по тек. цене {size['last_price']:g}):* {fmt_rub(size['notional_rub'])} ₽\n"
             if size else
             "📐 *Размер позиции (по тек. цене):* нет данных (торгов сегодня не было)\n"
         )
@@ -686,7 +705,7 @@ async def numeric_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             f"📌 *{params['ticker']}*\n"
             f"Количество: {contracts} контр.\n"
             f"━━━━━━━━━━━━━━━━━━━━\n"
-            f"🏦 *Сумма позиции (ГО):* {quick['margin']:,.0f} ₽\n"
+            f"🏦 *Сумма позиции (ГО):* {fmt_rub(quick['margin'])} ₽\n"
             f"{oi_line}"
             f"{size_line}"
             f"━━━━━━━━━━━━━━━━━━━━"
@@ -755,10 +774,10 @@ async def numeric_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             f"✅ *РАСЧЕТ ГОТОВ*\n━━━━━━━━━━━━━━━━━━━━\n"
             f"📌 {params['ticker']} | {dir_label} | {int(params['contracts'])} контр.\n"
             f"Вход: {params['entry_price']} → TP: {params['tp']} / SL: {params['sl']}\n\n"
-            f"💰 *Прибыль:* {results['profit']:,.0f} ₽ ({results['steps_tp']} шагов)\n"
-            f"📉 *Убыток:* {results['loss']:,.0f} ₽ ({results['steps_sl']} шагов)\n"
+            f"💰 *Прибыль:* {fmt_rub(results['profit'])} ₽ ({results['steps_tp']} шагов)\n"
+            f"📉 *Убыток:* {fmt_rub(results['loss'])} ₽ ({results['steps_sl']} шагов)\n"
             f"⚖️ *Risk/Reward:* 1 : {results['rr_ratio']}\n\n"
-            f"🏦 *Маржа (ГО):* {results['margin']:,.0f} ₽\n"
+            f"🏦 *Маржа (ГО):* {fmt_rub(results['margin'])} ₽\n"
             f"⚠️ *Риск при срабатывании SL:* {results['risk_pct']}% от суммы ГО по этой позиции"
             f"\n━━━━━━━━━━━━━━━━━━━━"
         )
