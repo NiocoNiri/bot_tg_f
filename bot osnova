@@ -21,6 +21,13 @@ logging.basicConfig(format='%(asctime)s - %(levelname)s - %(message)s', level=lo
 logger = logging.getLogger(__name__)
 
 TOKEN = os.environ.get("FUTURES_BOT_TOKEN", "8723962906:AAFu7RV1FCvBJQl1rkhLQAHUMnWudxAoFEw")
+# НОВОЕ: прокси для подключения к Telegram API (api.telegram.org). Нужен, если
+# Telegram недоступен напрямую из вашей сети (частая ситуация в РФ) — тогда
+# бот падает с httpx.ConnectTimeout/telegram.error.TimedOut ещё на старте,
+# до любого обращения к МосБирже. Задайте переменную окружения TELEGRAM_PROXY,
+# например: http://127.0.0.1:8080 или socks5://127.0.0.1:1080
+# (для socks5 дополнительно нужен пакет: pip install "httpx[socks]").
+TELEGRAM_PROXY = os.environ.get("TELEGRAM_PROXY", "").strip() or None
 DB_PATH = "futures_calc.db"
 PERSISTENCE_FILE = "bot_persistence.pkl"
 
@@ -822,13 +829,19 @@ def main():
     # вместе с persistent=True нужен:
     #   pip install "python-telegram-bot[job-queue]"
     persistence = PicklePersistence(filepath=PERSISTENCE_FILE)
-    app = (
+    builder = (
         ApplicationBuilder()
         .token(TOKEN)
         .persistence(persistence)
         .post_init(post_init)  # синхронизация с МосБиржей перед стартом polling
-        .build()
     )
+    if TELEGRAM_PROXY:
+        # proxy — для обычных запросов к API, get_updates_proxy — отдельно для
+        # долгих long-polling запросов get_updates(). Нужны оба, иначе часть
+        # запросов всё равно пойдёт напрямую и будет падать по таймауту.
+        builder = builder.proxy(TELEGRAM_PROXY).get_updates_proxy(TELEGRAM_PROXY)
+        logger.info(f"Использую прокси для подключения к Telegram: {TELEGRAM_PROXY}")
+    app = builder.build()
 
     if app.job_queue is not None:
         app.job_queue.run_repeating(
