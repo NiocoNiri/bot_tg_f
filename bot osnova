@@ -1,4 +1,4 @@
-
+"""Калькулятор фьючерсов MOEX для Telegram.
 
 Установка: python -m pip install "python-telegram-bot[job-queue]>=22,<23"
 Запуск:    python futures_bot.py
@@ -15,6 +15,7 @@ import os
 import sqlite3
 from contextlib import contextmanager
 from datetime import date, datetime
+from decimal import Decimal, ROUND_HALF_UP
 from pathlib import Path
 from urllib.parse import urlencode
 from urllib.request import Request, urlopen
@@ -60,7 +61,19 @@ SELECT, CONTRACT_COUNT, AFTER_SUM, DIRECTION, ENTRY, TAKE_PROFIT, STOP_LOSS = ra
 
 
 def rub(number):
-    return f"{number:,.0f}".replace(",", " ")
+    whole = decimal_number(number).quantize(Decimal("1"), rounding=ROUND_HALF_UP)
+    return f"{whole:,.0f}".replace(",", " ")
+
+
+def decimal_number(value):
+    """Точное десятичное представление для вычислений денежных сумм."""
+    return Decimal(str(value))
+
+
+def rounded(value, places=2):
+    """Округляем только окончательный результат; 0.005 → 0.01."""
+    unit = Decimal("1").scaleb(-places)
+    return float(value.quantize(unit, rounding=ROUND_HALF_UP))
 
 
 class Database:
@@ -369,36 +382,39 @@ async def selected(update, context):
 
 
 def quick_calculation(instrument, count):
-    margin = positive(instrument["go_initial"]) * count
-    oi = positive(instrument.get("open_interest"))
-    last = positive(instrument.get("last_price"))
-    multiplier = positive(instrument["step_cost"]) / positive(instrument["step_price"])
+    margin_per_contract = decimal_number(instrument["go_initial"])
+    oi = decimal_number(positive(instrument.get("open_interest")))
+    last = decimal_number(positive(instrument.get("last_price")))
+    multiplier = decimal_number(instrument["step_cost"]) / decimal_number(instrument["step_price"])
     return {
-        "margin": margin,
-        "oi": oi,
-        "oi_value": oi * positive(instrument["go_initial"]),
-        "last": last,
-        "position": last * multiplier * count,
+        "margin": rounded(margin_per_contract * count),
+        "oi": float(oi),
+        "oi_value": rounded(oi * margin_per_contract),
+        "last": float(last),
+        "position": rounded(last * multiplier * count),
     }
 
 
 def full_calculation(params, instrument):
-    entry, tp, sl = (params[key] for key in ("entry_price", "tp", "sl"))
+    entry, tp, sl = (decimal_number(params[key]) for key in ("entry_price", "tp", "sl"))
     count = params["contracts"]
+    step = decimal_number(instrument["step_price"])
+    step_cost = decimal_number(instrument["step_cost"])
+    zero = Decimal("0")
     if params["direction"] == "long":
-        profit_steps = max(0, tp - entry) / instrument["step_price"]
-        loss_steps = max(0, entry - sl) / instrument["step_price"]
+        profit_steps = max(zero, tp - entry) / step
+        loss_steps = max(zero, entry - sl) / step
     else:
-        profit_steps = max(0, entry - tp) / instrument["step_price"]
-        loss_steps = max(0, sl - entry) / instrument["step_price"]
-    profit = round(profit_steps * instrument["step_cost"] * count, 2)
-    loss = round(loss_steps * instrument["step_cost"] * count, 2)
-    margin = round(instrument["go_initial"] * count, 2)
+        profit_steps = max(zero, entry - tp) / step
+        loss_steps = max(zero, sl - entry) / step
+    profit = profit_steps * step_cost * count
+    loss = loss_steps * step_cost * count
+    margin = decimal_number(instrument["go_initial"]) * count
     return {
-        "profit": profit, "loss": loss, "margin": margin,
-        "steps_tp": round(profit_steps, 1), "steps_sl": round(loss_steps, 1),
-        "rr_ratio": round(profit / loss, 2) if loss else float("inf"),
-        "risk_pct": round(loss / margin * 100, 2),
+        "profit": rounded(profit), "loss": rounded(loss), "margin": rounded(margin),
+        "steps_tp": rounded(profit_steps, 1), "steps_sl": rounded(loss_steps, 1),
+        "rr_ratio": rounded(profit / loss) if loss else float("inf"),
+        "risk_pct": rounded(loss / margin * 100),
     }
 
 
@@ -638,8 +654,14 @@ def main():
     app.add_handler(CallbackQueryHandler(stale_button))
     app.add_error_handler(on_error)
     log.info("Подключаюсь к Telegram API (готовность будет указана отдельно)")
-    # Повторяем подключение после временного сетевого сбоя. Обновления не сбрасываем.
-    app.run_polling(bootstrap_retries=-1, drop_pending_updates=False)
+    # Явно подписываемся на сообщения И на нажатия inline-кнопок.
+    # Без allowed_updates Telegram сохраняет прежний фильтр этого токена:
+    # /start может приходить, а callback_query — отсутствовать полностью.
+    app.run_polling(
+        allowed_updates=["message", "callback_query"],
+        bootstrap_retries=-1,
+        drop_pending_updates=False,
+    )
 
 
 if __name__ == "__main__":
