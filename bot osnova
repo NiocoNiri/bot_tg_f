@@ -1,6 +1,6 @@
 """Калькулятор фьючерсов MOEX для Telegram.
 
-Установка: python -m pip install "python-telegram-bot[job-queue]>=22,<23"
+#Установка: python -m pip install "python-telegram-bot[job-queue]>=22,<23"
 Запуск:    python futures_bot.py
 
 База futures_calc.db и состояния bot_persistence.pkl хранятся рядом с файлом.
